@@ -151,6 +151,10 @@ def test_primitive_vs_reference_decode(
     [
         [(1, 1328), (5, 18), (129, 463)],
         [(1, 523), (1, 37), (1, 2011)],
+        # Prefill-only: all q_len > 1, guarantees tiled kernel dispatch
+        # (total_q_tokens > num_seqs).
+        [(8, 128), (16, 256)],
+        [(32, 512), (64, 1024)],
     ],
 )
 @pytest.mark.parametrize(

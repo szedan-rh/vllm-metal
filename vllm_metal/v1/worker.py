@@ -174,7 +174,7 @@ class MetalWorker(WorkerBase):
         psutil.available is intentionally excluded — it reflects OS page-cache
         state and is blind to MLX wired buffers holding model weights.
         """
-        return WorkerCachePlanner.kv_budget_bytes(
+        return WorkerCachePlanner.base_kv_budget_bytes(
             metal_limit,
             model_memory,
             fraction,

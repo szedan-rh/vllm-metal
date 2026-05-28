@@ -603,16 +603,6 @@ class WorkerCachePlanner:
     def __init__(self, worker: MetalWorker) -> None:
         self._worker = worker
 
-    @staticmethod
-    def kv_budget_bytes(
-        metal_limit: int,
-        model_memory: int,
-        fraction: float,
-        overhead: int,
-    ) -> int:
-        """Return Metal-memory budget available for paged KV cache."""
-        return int(metal_limit * fraction) - model_memory - overhead
-
     def setup_paged_attention(self, *, overhead: int) -> None:
         """Allocate paged KV cache and patch the loaded model."""
         self._worker.model_runner.validate_paged_attention_support()
@@ -704,6 +694,16 @@ class WorkerCachePlanner:
         )
         return available
 
+    @staticmethod
+    def base_kv_budget_bytes(
+        metal_limit: int,
+        model_memory: int,
+        fraction: float,
+        overhead: int,
+    ) -> int:
+        """Return Metal-memory budget before hybrid GDN reservation."""
+        return int(metal_limit * fraction) - model_memory - overhead
+
     def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
         block_size = self._worker.vllm_config.cache_config.block_size
         fraction = self._memory_fraction()
@@ -711,7 +711,7 @@ class WorkerCachePlanner:
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
         usable_metal = int(metal_limit * fraction)
-        base_kv_budget = self.kv_budget_bytes(
+        base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
             model_memory,
             fraction,

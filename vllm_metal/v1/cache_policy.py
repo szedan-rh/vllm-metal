@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import mlx.core as mx
 import torch
@@ -86,31 +87,40 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
     @classmethod
-    def merge(cls, specs):
-        assert all(isinstance(s, TurboQuantAttentionSpec) for s in specs), (
-            "All attention layers in the same KV cache group must be "
-            "TurboQuantAttentionSpec."
-        )
-        k_set = {s.k_quant for s in specs}
-        v_set = {s.v_quant for s in specs}
-        assert len(k_set) == 1 and len(v_set) == 1, (
-            "All TurboQuant layers in the same cache group must share the "
-            "same (k_quant, v_quant); mixed-quant groups are not supported."
-        )
+    def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
+        turbo_specs: list[TurboQuantAttentionSpec] = []
+        for spec in specs:
+            if not isinstance(spec, TurboQuantAttentionSpec):
+                raise TypeError(
+                    "All attention layers in the same KV cache group must be "
+                    "TurboQuantAttentionSpec."
+                )
+            turbo_specs.append(spec)
+        if not turbo_specs:
+            raise ValueError("TurboQuantAttentionSpec.merge() requires specs")
+
+        k_set = {s.k_quant for s in turbo_specs}
+        v_set = {s.v_quant for s in turbo_specs}
+        if len(k_set) != 1 or len(v_set) != 1:
+            raise ValueError(
+                "All TurboQuant layers in the same cache group must share the "
+                "same (k_quant, v_quant); mixed-quant groups are not supported."
+            )
+        first = turbo_specs[0]
         return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
-            head_size_v=specs[0].head_size_v,
-            dtype=specs[0].dtype,
-            page_size_padded=specs[0].page_size_padded,
+            block_size=first.block_size,
+            num_kv_heads=first.num_kv_heads,
+            head_size=first.head_size,
+            head_size_v=first.head_size_v,
+            dtype=first.dtype,
+            page_size_padded=first.page_size_padded,
             sliding_window=cls.merge_window_sizes(
-                {s.sliding_window for s in specs if s.sliding_window is not None}
+                {s.sliding_window for s in turbo_specs if s.sliding_window is not None}
             ),
             attention_chunk_size=cls.merge_window_sizes(
                 {
                     s.attention_chunk_size
-                    for s in specs
+                    for s in turbo_specs
                     if s.attention_chunk_size is not None
                 }
             ),
@@ -236,9 +246,7 @@ class ModelCachePolicy:
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         config = get_config()
-        use_turboquant = (
-            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
-        )
+        use_turboquant = self._use_turboquant(config)
 
         kv_heads_list = self._runner.kv_heads_per_layer
         head_dim_list = self._runner.head_dim_per_layer
@@ -304,15 +312,11 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
 
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
-        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+        if self._use_turboquant(config):
             return num_kv_layers * _turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=self._runner.num_kv_heads,
@@ -321,8 +325,7 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        kv_factor = 1 if self._runner.is_mla else 2
-        return kv_factor * block_size * dtype_size * self._kv_layer_size_sum()
+        return self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""
@@ -386,15 +389,11 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
 
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
-        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+        if self._use_turboquant(config):
             # _turboquant_page_size_bytes is parameterised by tokens (block_size);
             # pass aligned_tokens to get the per-sequence byte total directly.
             return num_kv_layers * _turboquant_page_size_bytes(
@@ -405,9 +404,8 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        kv_factor = 1 if self._runner.is_mla else 2
         sdpa_kv_bytes = (
-            kv_factor * aligned_tokens * dtype_size * self._kv_layer_size_sum()
+            self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
         if self._runner.is_hybrid:
             return sdpa_kv_bytes + self.linear_cache_bytes_per_slot()
@@ -415,24 +413,6 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionBackend:
         config = get_config()
-        if config.turboquant:
-            return HybridPagedAttentionBackend(
-                num_layers=self._runner.num_layers,
-                full_attention_interval=self._runner.full_attention_interval,
-                max_num_seqs=self._runner.scheduler_config.max_num_seqs,
-                num_kv_heads=self._runner.num_kv_heads,
-                head_dim=self._runner.head_dim,
-                linear_num_v_heads=self._runner.linear_num_v_heads,
-                linear_key_head_dim=self._runner.linear_key_head_dim,
-                linear_value_head_dim=self._runner.linear_value_head_dim,
-                linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-                linear_conv_dim=self._runner.linear_conv_dim,
-                block_size=block_size,
-                dtype=self._require_kv_cache_dtype(),
-                turboquant=True,
-                k_quant=config.k_quant,
-                v_quant=config.v_quant,
-            )
         return HybridPagedAttentionBackend(
             num_layers=self._runner.num_layers,
             full_attention_interval=self._runner.full_attention_interval,
@@ -446,9 +426,9 @@ class ModelCachePolicy:
             linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
-            turboquant=False,
-            k_quant=None,
-            v_quant=None,
+            turboquant=config.turboquant,
+            k_quant=config.k_quant if config.turboquant else None,
+            v_quant=config.v_quant if config.turboquant else None,
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionBackend:
@@ -535,16 +515,25 @@ class ModelCachePolicy:
 
         For uniform models this equals ``num_kv_layers × kv_heads × head_dim``.
         """
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
         if kv_heads is not None and head_dims is not None:
             return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
         return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
+
+    def _num_kv_cache_layers(self) -> int:
+        if self._runner.is_hybrid:
+            return self._runner.num_sdpa_layers
+        return self._runner.num_kv_cache_layers
+
+    def _use_turboquant(self, config: Any) -> bool:
+        return bool(
+            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
+        )
+
+    def _kv_factor(self) -> int:
+        return 1 if self._runner.is_mla else 2
 
     def _mha_cache_layout(self) -> tuple[int, list[int] | None]:
         if self._runner._yoco_cache_mapping is None:

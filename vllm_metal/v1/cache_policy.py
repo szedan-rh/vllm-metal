@@ -201,11 +201,55 @@ class _PagedAttentionPlan:
     metal_limit: int
     usable_metal: int
     model_memory: int
+    overhead: int
     per_block_bytes: int
-    kv_budget_before_hybrid: int
+    base_kv_budget: int
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+
+    def format_breakdown(self) -> str:
+        before_hybrid = (
+            f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB, "
+            if self.hybrid_gdn_reservation.enabled
+            else ""
+        )
+        return (
+            f"metal_limit={self.metal_limit / 1e9:.2f}GB, "
+            f"fraction={self.fraction}, "
+            f"usable_metal={self.usable_metal / 1e9:.2f}GB, "
+            f"model_memory={self.model_memory / 1e9:.2f}GB, "
+            f"overhead={self.overhead / 1e9:.2f}GB, "
+            f"{before_hybrid}"
+            f"{self._hybrid_gdn_detail()}"
+            f"kv_budget={self.kv_budget / 1e9:.2f}GB"
+        )
+
+    def format_mitigations(self) -> str:
+        mitigations = [
+            "increase VLLM_METAL_MEMORY_FRACTION",
+            "use a smaller or more quantized model",
+        ]
+        reservation = self.hybrid_gdn_reservation
+        if reservation.enabled and reservation.max_num_seqs > 1:
+            seq_mitigation = (
+                "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
+            )
+            if self.base_kv_budget > 0:
+                mitigations.insert(0, seq_mitigation)
+            else:
+                mitigations.append(seq_mitigation)
+        return "Mitigations: " + "; ".join(mitigations) + "."
+
+    def _hybrid_gdn_detail(self) -> str:
+        reservation = self.hybrid_gdn_reservation
+        if not reservation.enabled:
+            return ""
+        return (
+            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
+            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+            f"max_num_seqs={reservation.max_num_seqs}), "
+        )
 
 
 class ModelCachePolicy:
@@ -569,75 +613,6 @@ class WorkerCachePlanner:
         """Return Metal-memory budget available for paged KV cache."""
         return int(metal_limit * fraction) - model_memory - overhead
 
-    def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
-        """Return startup GDN state reserved outside the paged KV pool."""
-        runner = self._worker.model_runner
-        if not runner.is_hybrid:
-            return _HybridGDNReservation()
-        return _HybridGDNReservation(
-            bytes_per_slot=runner.linear_cache_bytes_per_slot(),
-            max_num_seqs=runner.scheduler_config.max_num_seqs,
-        )
-
-    @staticmethod
-    def _hybrid_gdn_detail(reservation: _HybridGDNReservation) -> str:
-        if not reservation.enabled:
-            return ""
-        return (
-            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
-            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
-            f"max_num_seqs={reservation.max_num_seqs}), "
-        )
-
-    @staticmethod
-    def _paged_attention_mitigations(
-        reservation: _HybridGDNReservation,
-        *,
-        kv_budget_before_hybrid: int,
-    ) -> str:
-        mitigations = [
-            "increase VLLM_METAL_MEMORY_FRACTION",
-            "use a smaller or more quantized model",
-        ]
-        if reservation.enabled and reservation.max_num_seqs > 1:
-            seq_mitigation = (
-                "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
-            )
-            if kv_budget_before_hybrid > 0:
-                mitigations.insert(0, seq_mitigation)
-            else:
-                mitigations.append(seq_mitigation)
-        return "Mitigations: " + "; ".join(mitigations) + "."
-
-    @classmethod
-    def _memory_breakdown(
-        cls,
-        *,
-        metal_limit: int,
-        fraction: float,
-        usable_metal: int,
-        model_memory: int,
-        overhead: int,
-        kv_budget_before_hybrid: int,
-        reservation: _HybridGDNReservation,
-        kv_budget: int,
-    ) -> str:
-        before_hybrid = (
-            f"kv_budget_before_hybrid={kv_budget_before_hybrid / 1e9:.2f}GB, "
-            if reservation.enabled
-            else ""
-        )
-        return (
-            f"metal_limit={metal_limit / 1e9:.2f}GB, "
-            f"fraction={fraction}, "
-            f"usable_metal={usable_metal / 1e9:.2f}GB, "
-            f"model_memory={model_memory / 1e9:.2f}GB, "
-            f"overhead={overhead / 1e9:.2f}GB, "
-            f"{before_hybrid}"
-            f"{cls._hybrid_gdn_detail(reservation)}"
-            f"kv_budget={kv_budget / 1e9:.2f}GB"
-        )
-
     def setup_paged_attention(self, *, overhead: int) -> None:
         """Allocate paged KV cache and patch the loaded model."""
         self._worker.model_runner.validate_paged_attention_support()
@@ -646,16 +621,7 @@ class WorkerCachePlanner:
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
-            self._memory_breakdown(
-                metal_limit=plan.metal_limit,
-                fraction=plan.fraction,
-                usable_metal=plan.usable_metal,
-                model_memory=plan.model_memory,
-                overhead=overhead,
-                kv_budget_before_hybrid=plan.kv_budget_before_hybrid,
-                reservation=plan.hybrid_gdn_reservation,
-                kv_budget=plan.kv_budget,
-            ),
+            plan.format_breakdown(),
             plan.per_block_bytes,
             plan.num_blocks,
             plan.num_blocks * plan.block_size,
@@ -745,55 +711,54 @@ class WorkerCachePlanner:
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
         usable_metal = int(metal_limit * fraction)
-        kv_budget_before_hybrid = self.kv_budget_bytes(
+        base_kv_budget = self.kv_budget_bytes(
             metal_limit,
             model_memory,
             fraction,
             overhead,
         )
         reservation = self._hybrid_gdn_reservation()
-        kv_budget = kv_budget_before_hybrid - reservation.total_bytes
-
-        breakdown = self._memory_breakdown(
-            metal_limit=metal_limit,
-            fraction=fraction,
-            usable_metal=usable_metal,
-            model_memory=model_memory,
-            overhead=overhead,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
-            reservation=reservation,
-            kv_budget=kv_budget,
-        )
-        mitigations = self._paged_attention_mitigations(
-            reservation,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
-        )
-
-        if kv_budget <= 0:
-            raise ValueError(
-                "Paged attention: not enough Metal memory for KV cache. "
-                f"{breakdown}. {mitigations}"
-            )
-
-        num_blocks = kv_budget // per_block_bytes
-        if num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
-            raise ValueError(
-                "Paged attention: computed num_blocks too low "
-                f"({num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
-                f"{breakdown}, per_block_bytes={per_block_bytes}. {mitigations}"
-            )
-
-        return _PagedAttentionPlan(
+        kv_budget = base_kv_budget - reservation.total_bytes
+        plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
             metal_limit=metal_limit,
             usable_metal=usable_metal,
             model_memory=model_memory,
+            overhead=overhead,
             per_block_bytes=per_block_bytes,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
+            base_kv_budget=base_kv_budget,
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
-            num_blocks=num_blocks,
+            num_blocks=kv_budget // per_block_bytes,
+        )
+        self._validate_paged_attention_plan(plan)
+        return plan
+
+    def _validate_paged_attention_plan(self, plan: _PagedAttentionPlan) -> None:
+        if plan.kv_budget <= 0:
+            raise ValueError(
+                "Paged attention: not enough Metal memory for KV cache. "
+                f"{plan.format_breakdown()}. {plan.format_mitigations()}"
+            )
+
+        if plan.num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
+            raise ValueError(
+                "Paged attention: computed num_blocks too low "
+                f"({plan.num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
+                f"{plan.format_breakdown()}, "
+                f"per_block_bytes={plan.per_block_bytes}. "
+                f"{plan.format_mitigations()}"
+            )
+
+    def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
+        """Return startup GDN state reserved outside the paged KV pool."""
+        runner = self._worker.model_runner
+        if not runner.is_hybrid:
+            return _HybridGDNReservation()
+        return _HybridGDNReservation(
+            bytes_per_slot=runner.linear_cache_bytes_per_slot(),
+            max_num_seqs=runner.scheduler_config.max_num_seqs,
         )
 
     def _memory_fraction(self) -> float:

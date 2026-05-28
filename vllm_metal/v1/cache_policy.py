@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 import mlx.core as mx
 import torch
@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
+    MetalConfig,
     get_config,
 )
 from vllm_metal.metal_kernel_backend.turboquant import (
@@ -388,7 +389,7 @@ class ModelCachePolicy:
             return self._build_mla_backend(block_size)
         return self._build_mha_backend(block_size)
 
-    def _install_gemma4_mtp_kv_sharing(
+    def install_gemma4_mtp_kv_sharing(
         self,
         backend: PagedAttentionBackend,
         *,
@@ -558,7 +559,7 @@ class ModelCachePolicy:
             return self._runner.num_sdpa_layers
         return self._runner.num_kv_cache_layers
 
-    def _use_turboquant(self, config: Any) -> bool:
+    def _use_turboquant(self, config: MetalConfig) -> bool:
         return bool(
             config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
         )
@@ -608,7 +609,7 @@ class WorkerCachePlanner:
             block_size=plan.block_size
         )
         backend.initialize(plan.num_blocks)
-        self._worker.model_runner._cache_policy._install_gemma4_mtp_kv_sharing(
+        self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
             block_size=plan.block_size,
         )
@@ -635,8 +636,10 @@ class WorkerCachePlanner:
             config.k_quant if config.turboquant else "N/A",
         )
 
-        self._worker.model_runner._paged_attention_backend = backend
-        self._worker.model_runner._paged_block_size = plan.block_size
+        self._worker.model_runner.install_paged_attention_backend(
+            backend,
+            block_size=plan.block_size,
+        )
 
     def get_model_memory_usage(self) -> int:
         """Return current model memory usage in bytes."""
@@ -656,7 +659,7 @@ class WorkerCachePlanner:
         if mode == "paged_attention_capacity":
             overhead = self._worker.model_runner.profile_run()
             self.setup_paged_attention(overhead=overhead)
-            backend = self._worker.model_runner._paged_attention_backend
+            backend = self._worker.model_runner.paged_attention_backend
             if backend is None:
                 raise RuntimeError(
                     "Paged attention backend not initialized for capacity reporting"

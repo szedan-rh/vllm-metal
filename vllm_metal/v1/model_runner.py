@@ -609,6 +609,33 @@ class MetalModelRunner:
         """Build the paged-attention backend for the loaded model."""
         return self._cache_policy.build_paged_attention_backend(block_size=block_size)
 
+    @property
+    def paged_attention_backend(self) -> PagedAttentionBackend | None:
+        """Return the installed paged-attention backend, if any."""
+        return self._paged_attention_backend
+
+    def install_paged_attention_backend(
+        self,
+        backend: PagedAttentionBackend,
+        *,
+        block_size: int,
+    ) -> None:
+        """Record the initialized paged-attention backend owned by this runner."""
+        self._paged_attention_backend = backend
+        self._paged_block_size = block_size
+
+    def install_gemma4_mtp_kv_sharing(
+        self,
+        backend: PagedAttentionBackend,
+        *,
+        block_size: int,
+    ) -> None:
+        """Wire Gemma4 MTP assistant sharing after paged cache initialization."""
+        self._cache_policy.install_gemma4_mtp_kv_sharing(
+            backend,
+            block_size=block_size,
+        )
+
     def estimate_one_sequence_kv_bytes(
         self, *, max_model_len: int, block_size: int
     ) -> int:

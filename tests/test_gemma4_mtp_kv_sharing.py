@@ -508,7 +508,7 @@ def test_cache_policy_installs_gemma4_mtp_kv_sharing() -> None:
         _gemma4_mtp_assistant=_AssistantRuntime(),
     )
 
-    runner._cache_policy._install_gemma4_mtp_kv_sharing(
+    runner._cache_policy.install_gemma4_mtp_kv_sharing(
         backend,
         block_size=_BLOCK_SIZE,
     )
@@ -523,7 +523,7 @@ def test_cache_policy_rejects_gemma4_mtp_without_mha_backend() -> None:
     )
 
     with pytest.raises(NotImplementedError, match="requires the MHA paged"):
-        runner._cache_policy._install_gemma4_mtp_kv_sharing(
+        runner._cache_policy.install_gemma4_mtp_kv_sharing(
             object(),
             block_size=_BLOCK_SIZE,
         )

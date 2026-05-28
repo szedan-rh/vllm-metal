@@ -209,21 +209,18 @@ class _PagedAttentionPlan:
     num_blocks: int
 
     def format_breakdown(self) -> str:
-        before_hybrid = (
-            f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB, "
-            if self.hybrid_gdn_reservation.enabled
-            else ""
-        )
-        return (
-            f"metal_limit={self.metal_limit / 1e9:.2f}GB, "
-            f"fraction={self.fraction}, "
-            f"usable_metal={self.usable_metal / 1e9:.2f}GB, "
-            f"model_memory={self.model_memory / 1e9:.2f}GB, "
-            f"overhead={self.overhead / 1e9:.2f}GB, "
-            f"{before_hybrid}"
-            f"{self._hybrid_gdn_detail()}"
-            f"kv_budget={self.kv_budget / 1e9:.2f}GB"
-        )
+        parts = [
+            f"metal_limit={self.metal_limit / 1e9:.2f}GB",
+            f"fraction={self.fraction}",
+            f"usable_metal={self.usable_metal / 1e9:.2f}GB",
+            f"model_memory={self.model_memory / 1e9:.2f}GB",
+            f"overhead={self.overhead / 1e9:.2f}GB",
+        ]
+        if self.hybrid_gdn_reservation.enabled:
+            parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
+            parts.append(self._hybrid_gdn_detail())
+        parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
+        return ", ".join(parts)
 
     def format_mitigations(self) -> str:
         mitigations = [
@@ -248,7 +245,7 @@ class _PagedAttentionPlan:
         return (
             f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
             f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
-            f"max_num_seqs={reservation.max_num_seqs}), "
+            f"max_num_seqs={reservation.max_num_seqs})"
         )
 
 
@@ -658,7 +655,7 @@ class WorkerCachePlanner:
 
         if mode == "paged_attention_capacity":
             overhead = self._worker.model_runner.profile_run()
-            self._worker._setup_paged_attention(overhead=overhead)
+            self.setup_paged_attention(overhead=overhead)
             backend = self._worker.model_runner._paged_attention_backend
             if backend is None:
                 raise RuntimeError(
@@ -720,7 +717,7 @@ class WorkerCachePlanner:
             base_kv_budget=base_kv_budget,
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
-            num_blocks=kv_budget // per_block_bytes,
+            num_blocks=max(0, kv_budget // per_block_bytes),
         )
         self._validate_paged_attention_plan(plan)
         return plan

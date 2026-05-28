@@ -86,7 +86,9 @@ class TestWorkerRunnerBoundaryDelegation:
             paged_attention_enabled=True
         )
 
-    def test_determine_available_memory_paged_capacity_mode(self) -> None:
+    def test_determine_available_memory_paged_capacity_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         num_blocks = 8
         block_size_bytes = 16
         measured_overhead = 200 * 1024 * 1024
@@ -105,15 +107,18 @@ class TestWorkerRunnerBoundaryDelegation:
                 num_blocks=lambda: num_blocks
             )
 
-        worker._setup_paged_attention = MagicMock(side_effect=_fake_setup)
+        setup_paged_attention = MagicMock(side_effect=_fake_setup)
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "setup_paged_attention",
+            setup_paged_attention,
+        )
 
         available = MetalWorker.determine_available_memory(worker)
 
         assert available == num_blocks * block_size_bytes
         model_runner.profile_run.assert_called_once_with()
-        worker._setup_paged_attention.assert_called_once_with(
-            overhead=measured_overhead
-        )
+        setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:

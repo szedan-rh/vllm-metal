@@ -35,7 +35,6 @@ def try_enable_gemma4_yoco_fast_prefill(
     *,
     use_paged_attention: bool,
     num_paged_layers: int | None = None,
-    warn_on_skip: bool = True,
 ) -> bool:
     """Enable Gemma4 YOCO fast prefill when the loaded model is eligible."""
     reason = _yoco_fast_prefill_skip_reason(
@@ -44,20 +43,14 @@ def try_enable_gemma4_yoco_fast_prefill(
         num_paged_layers=num_paged_layers,
     )
     if reason is not None:
-        _log_fast_prefill_skip(
-            reason,
-            warn_on_skip=warn_on_skip,
-        )
+        _log_fast_prefill_skip(reason)
         return False
 
     if _install_gemma4_yoco_fast_prefill_patch(model):
         logger.info("Gemma4 YOCO fast prefill enabled")
         return True
 
-    _log_fast_prefill_skip(
-        "the Gemma4 text-model patch could not be installed",
-        warn_on_skip=warn_on_skip,
-    )
+    _log_fast_prefill_skip("the Gemma4 text-model patch could not be installed")
     return False
 
 
@@ -94,15 +87,8 @@ def _yoco_fast_prefill_skip_reason(
     return None
 
 
-def _log_fast_prefill_skip(reason: str, *, warn_on_skip: bool) -> None:
-    if warn_on_skip:
-        logger.warning(
-            "Gemma4 YOCO fast prefill is enabled, but %s; "
-            "continuing without fast prefill",
-            reason,
-        )
-    else:
-        logger.debug("Gemma4 YOCO fast prefill skipped: %s", reason)
+def _log_fast_prefill_skip(reason: str) -> None:
+    logger.debug("Gemma4 YOCO fast prefill skipped: %s", reason)
 
 
 @dataclass(frozen=True)

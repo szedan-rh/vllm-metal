@@ -1170,6 +1170,8 @@ class MetalModelRunner:
             mx.async_eval(pp_send_handle)
         else:
             assert logits is not None
+            # Hybrid GDN state writes are forward side effects and are not
+            # guaranteed to be forced by `mx.eval(logits)` alone.
             self._submit_paged_forward_outputs(
                 logits,
                 target_hidden_states=target_hidden_states,

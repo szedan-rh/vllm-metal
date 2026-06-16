@@ -1217,9 +1217,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 
-    def test_decode_only_hybrid_submits_logits_and_updated_gdn_states(
-        self, monkeypatch
-    ) -> None:
+    def test_hybrid_submits_logits_and_updated_gdn_states(self, monkeypatch) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
         runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())

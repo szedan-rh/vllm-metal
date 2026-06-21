@@ -986,11 +986,7 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
-            if (
-                ctx is not None
-                and runtime is not None
-                and runtime.needs_step_context()
-            ):
+            if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
                 runtime.populate_step_context(req_ids=step_req_ids, ctx=ctx)

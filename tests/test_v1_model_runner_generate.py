@@ -13,12 +13,13 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 
 
-class _HybridRuntimeStub:
+class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
         self._gdn_state_manager = HybridGDNStateManager(state_cache)
 
@@ -39,7 +40,7 @@ class _HybridRuntimeStub:
         self._gdn_state_manager.materialize_pending_state()
 
 
-class _ForwardOutputRuntimeStub:
+class ForwardOutputRuntimeStub:
     def __init__(self, arrays: list[mx.array]) -> None:
         self._arrays = arrays
 
@@ -54,10 +55,6 @@ class _ForwardOutputRuntimeStub:
 
     def materialize_pending_state(self) -> None:
         return None
-
-
-def _make_hybrid_runtime_stub(state_cache: GDNPagedStateCache) -> _HybridRuntimeStub:
-    return _HybridRuntimeStub(state_cache)
 
 
 class TestV1MetalModelRunnerGenerate:
@@ -397,7 +394,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             initial_seqs=0,
             dtype=mx.float32,
         )
-        backend = _make_hybrid_runtime_stub(state_cache)
+        backend = HybridRuntimeStub(state_cache)
         runner = make_stub_runner(
             tokenizer=object(),
             model_args={"full_attention_interval": 2},
@@ -1150,7 +1147,13 @@ class TestV1MetalModelRunnerExecuteModel:
 
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
-        runner._paged_attention_runtime = _ForwardOutputRuntimeStub([])
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
         req_state = mr.RequestState(
             token_ids=[1, 6],
             prompt_len=1,
@@ -1202,7 +1205,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
 
 class TestV1MetalModelRunnerGDNSubmit:
-    def _make_runtime_with_side_effects(self) -> _ForwardOutputRuntimeStub:
+    def make_runtime_with_side_effects(self) -> ForwardOutputRuntimeStub:
         conv_states = [
             mx.array([1], dtype=mx.float32),
             mx.array([2], dtype=mx.float32),
@@ -1211,12 +1214,11 @@ class TestV1MetalModelRunnerGDNSubmit:
             mx.array([3], dtype=mx.float32),
             mx.array([4], dtype=mx.float32),
         ]
-        return _ForwardOutputRuntimeStub([*conv_states, *recurrent_states])
+        return ForwardOutputRuntimeStub([*conv_states, *recurrent_states])
 
     def test_prefill_hybrid_submits_pending_compact_gdn_states(
         self, monkeypatch
     ) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
         cache = GDNPagedStateCache(
             num_layers=1,
@@ -1226,6 +1228,7 @@ class TestV1MetalModelRunnerGDNSubmit:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
+            initial_seqs=0,
             dtype=mx.float32,
         )
         pending_conv = mx.full((1, 1, 4), 7, dtype=mx.float32)
@@ -1233,15 +1236,13 @@ class TestV1MetalModelRunnerGDNSubmit:
         cache.ensure_capacity(2)
         cache.set_pending_conv_state(0, [1], pending_conv)
         cache.set_pending_recurrent_state(0, [1], pending_recurrent)
-        backend = _make_hybrid_runtime_stub(cache)
+        backend = HybridRuntimeStub(cache)
         runner = make_stub_runner(_paged_attention_runtime=backend)
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert len(submitted) == 1
         assert submitted[0][1] is pending_conv
         assert submitted[0][2] is pending_recurrent
@@ -1249,18 +1250,15 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert cache.has_pending_recurrent_state(0)
 
     def test_hybrid_submits_logits_and_updated_gdn_states(self, monkeypatch) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
-        runtime = self._make_runtime_with_side_effects()
+        runtime = self.make_runtime_with_side_effects()
         runner = make_stub_runner(_paged_attention_runtime=runtime)
         logits = mx.array([0], dtype=mx.float32)
         expected_states = runtime._arrays
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert len(submitted) == 1
         assert submitted[0][0] is logits
         assert len(submitted[0][1:]) == len(expected_states)
@@ -1268,18 +1266,85 @@ class TestV1MetalModelRunnerGDNSubmit:
             assert actual is expected
 
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_runtime=None)
+        runner = make_stub_runner(
+            _paged_attention_runtime=MHAPagedAttentionRuntime(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=4,
+                block_size=4,
+                dtype=mx.float32,
+            )
+        )
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert submitted == [(logits,)]
 
+
+class TestV1MetalModelRunnerGDNLifecycle:
+    def test_sample_tokens_materializes_reused_slot_state(self, monkeypatch) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner._execute_model_state = object()
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        runner._paged_request_seq_lens["done"] = 1
+
+        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        runner._cleanup_finished_requests({"done"}, materialize_gdn_state=False)
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        assert reused_slot == released_slot
+
+        cache.set_pending_conv_state(
+            0, [reused_slot], mx.full((1, 1, 4), 7, dtype=mx.float32)
+        )
+        cache.set_pending_recurrent_state(
+            0,
+            [reused_slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        expected_output = object()
+        monkeypatch.setattr(
+            runner,
+            "_sample_paged_batch",
+            lambda grammar_output: (mr._ExecutionBatch(), object()),
+        )
+        monkeypatch.setattr(runner, "_validate_scheduled_outputs", lambda *args: None)
+        monkeypatch.setattr(runner, "_build_output", lambda batch: expected_output)
+
+        output = runner.sample_tokens(None)
+
+        assert output is expected_output
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][reused_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][reused_slot]),
+            9,
+        )
+        assert runtime.gdn_state_manager.needs_materialize is False
 
 
 class TestRunnerMlaProperties:

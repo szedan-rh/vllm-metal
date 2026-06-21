@@ -7,6 +7,7 @@ import pytest
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
 
 
@@ -194,3 +195,69 @@ class TestHybridGDNStateManager:
         assert reused_slot == slot
         assert np.all(np.array(cache.conv_states[0][slot]) == 0)
         assert np.all(np.array(cache.recurrent_states[0][slot]) == 0)
+
+    def test_reused_slot_does_not_touch_other_live_slot(self) -> None:
+        cache = _make_cache(num_layers=1, max_seqs=2)
+        manager = HybridGDNStateManager(cache)
+        slot_a, slot_b = manager.assign_step_slots(["req-A", "req-B"])
+
+        conv_states = cache.conv_states[0]
+        conv_states[slot_a] = 5
+        conv_states[slot_b] = 11
+        cache.conv_states[0] = conv_states
+
+        recurrent_states = cache.recurrent_states[0]
+        recurrent_states[slot_a] = 3
+        recurrent_states[slot_b] = 13
+        cache.recurrent_states[0] = recurrent_states
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+
+        manager.release_requests({"req-A"})
+        reused_slot = manager.assign_step_slots(["req-C"])[0]
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+
+        assert reused_slot == slot_a
+        assert np.all(np.array(cache.conv_states[0][slot_a]) == 0)
+        assert np.all(np.array(cache.recurrent_states[0][slot_a]) == 0)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][slot_b]), 11)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot_b]), 13)
+
+
+class TestHybridPagedAttentionRuntime:
+    def test_initialize_wires_gdn_state_manager_delegation(self) -> None:
+        runtime = HybridPagedAttentionRuntime(
+            num_layers=2,
+            full_attention_interval=2,
+            max_num_seqs=2,
+            num_kv_heads=1,
+            head_dim=4,
+            linear_num_v_heads=1,
+            linear_key_head_dim=32,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=2,
+            linear_conv_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runtime.initialize(num_blocks=2)
+
+        ctx = _make_context()
+        runtime.populate_step_context(req_ids=["req-A"], ctx=ctx)
+
+        assert ctx.gdn_slot_mapping == [0]
+
+        cache = runtime.state_cache
+        slot = ctx.gdn_slot_mapping[0]
+        cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
+        cache.set_pending_recurrent_state(
+            0,
+            [slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        runtime.release_requests({"req-A"})
+        runtime.materialize_pending_state()
+
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        assert runtime.gdn_state_manager.needs_materialize is False

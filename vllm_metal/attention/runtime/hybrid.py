@@ -226,6 +226,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             raise RuntimeError("gdn_state_manager accessed before initialize()")
         return self._gdn_state_manager
 
+    def needs_step_context(self) -> bool:
+        return True
+
     def populate_step_context(
         self, *, req_ids: list[str], ctx: PagedAttentionContext
     ) -> None:

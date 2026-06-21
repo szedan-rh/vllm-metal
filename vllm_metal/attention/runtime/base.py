@@ -45,6 +45,10 @@ class PagedAttentionRuntimeBase:
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
 
+    def needs_step_context(self) -> bool:
+        """Return whether this runtime attaches request-ordered step metadata."""
+        return False
+
     def populate_step_context(
         self, *, req_ids: list[str], ctx: PagedAttentionContext
     ) -> None:

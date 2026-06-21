@@ -523,7 +523,7 @@ class MetalModelRunner:
         *,
         target_hidden_states: mx.array | None = None,
     ) -> None:
-        """Submit logits, hidden states, and GDN state side effects."""
+        """Submit logits, hidden states, and runtime-owned forward side effects."""
         outputs = [logits]
         if target_hidden_states is not None:
             outputs.append(target_hidden_states)
@@ -1050,8 +1050,8 @@ class MetalModelRunner:
             mx.async_eval(pp_send_handle)
         else:
             assert logits is not None
-            # Hybrid GDN state writes are forward side effects and are not
-            # guaranteed to be forced by `mx.eval(logits)` alone.
+            # Runtime-owned forward side effects may not be forced by
+            # evaluating logits alone, so submit the complete output set.
             self._submit_paged_forward_outputs(
                 logits,
                 target_hidden_states=target_hidden_states,
@@ -2159,12 +2159,12 @@ class MetalModelRunner:
         self,
         evicted_req_ids: set[str],
         *,
-        materialize_gdn_state: bool = True,
+        materialize_runtime_state: bool = True,
     ) -> None:
         """Evict runner-owned state for finished requests."""
         runtime = self._paged_attention_runtime
         if not evicted_req_ids:
-            if materialize_gdn_state and runtime is not None:
+            if materialize_runtime_state and runtime is not None:
                 runtime.materialize_pending_state()
             return
 
@@ -2182,7 +2182,7 @@ class MetalModelRunner:
 
         if runtime is not None:
             runtime.release_requests(evicted_req_ids)
-            if materialize_gdn_state:
+            if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
     def execute_model(
@@ -2220,7 +2220,7 @@ class MetalModelRunner:
         # evicted and any pending GDN release must be materialized now.
         self._cleanup_finished_requests(
             evicted_req_ids,
-            materialize_gdn_state=will_fail_fast_before_model_work,
+            materialize_runtime_state=will_fail_fast_before_model_work,
         )
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder

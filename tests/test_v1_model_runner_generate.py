@@ -1311,7 +1311,9 @@ class TestV1MetalModelRunnerGDNLifecycle:
         runner._paged_request_seq_lens["done"] = 1
 
         released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
-        runner._cleanup_finished_requests({"done"}, materialize_gdn_state=False)
+        runner._cleanup_finished_requests(
+            {"done"}, materialize_runtime_state=False
+        )
         reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
         assert reused_slot == released_slot
 

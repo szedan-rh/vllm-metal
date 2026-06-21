@@ -16,6 +16,7 @@ from vllm.v1.core.sched.output import (
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.qwen3_vl import (
@@ -97,6 +98,9 @@ class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
         self.gdn_state_manager = HybridGDNStateManager(state_cache)
 
+    def needs_step_context(self) -> bool:
+        return True
+
     def populate_step_context(self, *, req_ids: list[str], ctx: object) -> None:
         self.gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
 
@@ -113,7 +117,14 @@ class HybridRuntimeStub:
 def _paged_runner_with_encoder_cache(*, runtime: object | None = None):
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
-        _paged_attention_runtime=runtime or MagicMock(),
+        _paged_attention_runtime=runtime
+        or MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=16,
+            dtype=mx.float32,
+        ),
         _paged_block_size=16,
     )
     runner._start_paged_forward = MagicMock()

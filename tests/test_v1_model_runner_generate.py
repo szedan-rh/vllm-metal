@@ -23,6 +23,9 @@ class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
         self._gdn_state_manager = HybridGDNStateManager(state_cache)
 
+    def needs_step_context(self) -> bool:
+        return True
+
     @property
     def gdn_state_manager(self) -> HybridGDNStateManager:
         return self._gdn_state_manager
@@ -43,6 +46,9 @@ class HybridRuntimeStub:
 class ForwardOutputRuntimeStub:
     def __init__(self, arrays: list[mx.array]) -> None:
         self._arrays = arrays
+
+    def needs_step_context(self) -> bool:
+        return False
 
     def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
         del req_ids, ctx
@@ -1285,6 +1291,73 @@ class TestV1MetalModelRunnerGDNSubmit:
 
 
 class TestV1MetalModelRunnerGDNLifecycle:
+    def test_start_paged_forward_assigns_hybrid_slots_in_batch_order(
+        self, monkeypatch
+    ) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["decode-0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            ctx = mr.get_context()
+            assert ctx is not None
+            captured["input_ids"] = input_ids.tolist()
+            captured["gdn_slot_mapping"] = list(ctx.gdn_slot_mapping or [])
+            return mr.TargetModelForwardOutput(logits=mx.zeros((1, 2, 16)))
+
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        decode_state = mr.RequestState(
+            token_ids=[5, 6],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=1,
+        )
+        decode_state.block_ids = [0]
+        prefill = mr.PrefillRequest(
+            req_id="prefill-0",
+            token_ids=[9],
+            sampling_params=SamplingParams(),
+            block_ids=[1],
+            generator=None,
+            prompt_len=1,
+            start_pos=0,
+            full_prompt_token_ids=[9],
+        )
+        scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[prefill],
+            decode_reqs=[("decode-0", decode_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6, 9]]
+        assert captured["gdn_slot_mapping"] == [0, 1]
+        assert runtime.gdn_state_manager.request_slots == {
+            "decode-0": 0,
+            "prefill-0": 1,
+        }
+
     def test_sample_tokens_materializes_reused_slot_state(self, monkeypatch) -> None:
         cache = GDNPagedStateCache(
             num_layers=1,

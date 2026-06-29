@@ -98,12 +98,14 @@ def load_stt_model(model_name: str) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class GenerationLoadRequest:
+    """Immutable load-time view of the runner config."""
+
     model_name: str
     model_config: Any
     hf_config: Any
     is_vlm: bool
     target_dtype: Any
-    tokenizer_config: dict[str, Any]
+    tokenizer_config: Mapping[str, Any]
 
     @classmethod
     def from_runner(
@@ -112,6 +114,7 @@ class GenerationLoadRequest:
         model_adapter: ModelAdapter,
     ) -> GenerationLoadRequest:
         model_config = runner.model_config
+        # vLLM model_config shape varies across backends.
         hf_config = getattr(model_config, "hf_config", None)
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if model_adapter.should_force_text_backbone(hf_config):
@@ -129,6 +132,8 @@ class GenerationLoadRequest:
 
 @dataclass(frozen=True, slots=True)
 class LoadedGenerationModel:
+    """Loaded generation model plus metadata needed to wire the runner."""
+
     model: Any
     tokenizer: Any
     model_args: dict[str, Any]
@@ -144,13 +149,33 @@ class ModelLifecycle:
         self._model_adapter = model_adapter
 
     def load(self) -> None:
-        runner = self._runner
-        request = GenerationLoadRequest.from_runner(runner, self._model_adapter)
+        """Load the generation model and install runner runtime state."""
+
+        request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
         loaded_model = self._load_generation(request)
 
+        self._install_generation_model(loaded_model, request)
+
+        # Runtime extensions may depend on dimensions derived from model_args.
+        self.resolve_model_dims()
+        self._install_runtime_extensions(
+            loaded_model.model_args,
+            request,
+        )
+
+    def _install_generation_model(
+        self,
+        loaded_model: LoadedGenerationModel,
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install loaded generation state used by runner execution paths."""
+
+        runner = self._runner
         runner.model = loaded_model.model
         runner.tokenizer = loaded_model.tokenizer
         runner._is_vlm = request.is_vlm
+
+        # Adapter state follows the effective VLM mode, not the raw config flag.
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(
                 loaded_model.model, request.hf_config
@@ -163,16 +188,27 @@ class ModelLifecycle:
             EncoderCache() if multimodal_adapter is not None else None
         )
 
+        # Dimension resolution reads model_args immediately after this phase.
         runner.model_args = loaded_model.model_args
         runner._vocab_size = int(loaded_model.model_args["vocab_size"])
         if runner.metal_config.debug:
             logger.info("Model args: %s", loaded_model.model_args)
-        self.resolve_model_dims()
+
+    def _install_runtime_extensions(
+        self,
+        model_args: Mapping[str, Any],
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install optional runtime extensions after model dimensions resolve."""
+
+        runner = self._runner
+
+        # Clear stale extension state before loading replacement extensions.
         runner._gemma4_mtp_assistant = None
         gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
             speculative_config=runner.vllm_config.speculative_config,
             target_hf_config=request.hf_config,
-            target_model_args=loaded_model.model_args,
+            target_model_args=model_args,
         )
         runner.kv_cache_dtype = request.target_dtype
         runner._gemma4_mtp_assistant = gemma4_mtp_assistant
@@ -203,6 +239,8 @@ class ModelLifecycle:
         target_dtype: Any | None = None,
         tokenizer_config: Mapping[str, Any] | None = None,
     ) -> tuple[Any, Any]:
+        """Load and cache a text or VLM generation model."""
+
         model_config = (
             self._runner.model_config if model_config is None else model_config
         )
@@ -280,7 +318,6 @@ class ModelLifecycle:
         self,
         model_name: str,
         start_time: float,
-        *,
         model_config: Any,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],

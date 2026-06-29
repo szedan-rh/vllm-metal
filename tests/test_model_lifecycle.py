@@ -523,9 +523,11 @@ class TestModelLifecycle:
     ) -> None:
         runtime = object()
         calls: list[dict[str, object]] = []
+        call_time_dims: list[tuple[int, int]] = []
 
         class _StubGemma4MTPAssistantLoader:
             def load_if_needed(self, **kwargs: object) -> object:
+                call_time_dims.append((runner.hidden_size, runner.head_dim))
                 calls.append(kwargs)
                 return runtime
 
@@ -554,6 +556,7 @@ class TestModelLifecycle:
         call = calls[0]
         assert call["speculative_config"] is speculative_config
         assert call["target_model_args"] == runner.model_args
+        assert call_time_dims == [(4096, 128)]
         assert runner.hidden_size == 4096
 
     def test_load_clears_stale_gemma4_mtp_assistant_before_reload(

@@ -6,7 +6,6 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -37,61 +36,24 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_MODEL_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
-_MODEL_CACHE_LOCK = Lock()
-
 
 def reset_model_cache() -> None:
-    """Clear the process-level model cache.
-
-    Intended for tests that load multiple large models in sequence and
-    need a deterministic start between variants.  Uses the same lock
-    that protects every other ``_MODEL_CACHE`` access.
-
-    This is a narrow, test-oriented API so callers do not need to reach
-    into the private module global directly.
-    """
-    with _MODEL_CACHE_LOCK:
-        _MODEL_CACHE.clear()
+    """Clear lifecycle-owned assistant caches."""
     Gemma4MTPAssistantLoader.clear_cache()
 
 
-def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:
-    loader = "mlx_vlm" if is_vlm else "mlx_lm"
-    return (model_name, loader)
-
-
-def _stt_cache_key(model_name: str) -> tuple[str, str]:
-    return (model_name, "stt")
-
-
 def load_stt_model(model_name: str) -> Any:
-    """Load an STT model, reusing the process-level model cache.
+    """Load an STT model.
 
     Returns the loaded STT model. The caller (``STTModelRunner``) builds the
-    per-model runtime adapter and wires it onto the runner. Shares
-    ``_MODEL_CACHE`` with generation loads so ``reset_model_cache`` clears it.
+    per-model runtime adapter and wires it onto the runner.
     """
     start_time = time.time()
-    cache_key = _stt_cache_key(model_name)
-
-    with _MODEL_CACHE_LOCK:
-        cached = _MODEL_CACHE.get(cache_key)
-    if cached is not None:
-        model, _ = cached
-        logger.info(
-            "STT model loaded from cache in %.3fs: %s",
-            time.time() - start_time,
-            model_name,
-        )
-        return model
 
     from vllm_metal.stt.loader import load_model as stt_load_model
 
     logger.info("Loading STT model: %s", model_name)
     model = stt_load_model(model_name)
-    with _MODEL_CACHE_LOCK:
-        _MODEL_CACHE[cache_key] = (model, None)
     logger.info("STT model loaded in %.2fs: %s", time.time() - start_time, model_name)
     return model
 
@@ -239,7 +201,7 @@ class ModelLifecycle:
         target_dtype: Any | None = None,
         tokenizer_config: Mapping[str, Any] | None = None,
     ) -> tuple[Any, Any]:
-        """Load and cache a text or VLM generation model."""
+        """Load a text or VLM generation model."""
 
         model_config = (
             self._runner.model_config if model_config is None else model_config
@@ -254,70 +216,78 @@ class ModelLifecycle:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
 
-        # EngineArgs normalizes local GGUF inputs to quantization="gguf";
-        # the GGUF owner handles format-specific validation and loading.
+        # GGUF is a text load format; keep optional dependency handling there.
         if not is_vlm and model_config.quantization == "gguf":
-            return self._load_gguf_generation_model(
+            load_label = "GGUF model"
+            model, tokenizer = self._load_gguf_generation_model(
                 model_name,
-                start_time,
                 model_config=model_config,
                 target_dtype=target_dtype,
                 tokenizer_config=tokenizer_config,
             )
 
-        # AWQ checkpoints are owned end-to-end by AWQQuantLoader
-        # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
-        # cache key). Detection involves an HF Hub config fetch on cache
-        # miss, so first do a speculative cache lookup against both the
-        # AWQ and generic candidate keys; only invoke detection on miss.
-        # Probe the AWQ-specific key first so a previously cached AWQ load
-        # is served correctly even if the current detection call would
-        # have failed (e.g. transient Hub error after the cache was warmed).
-        generic_key = _generation_cache_key(model_name, is_vlm=is_vlm)
-        awq_key: tuple[str, str] | None = None
-        if not is_vlm:
-            awq_key = AWQQuantLoader.cache_key(model_name, target_dtype=target_dtype)
-
-        with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(awq_key) if awq_key is not None else None
-            if cached is None:
-                cached = _MODEL_CACHE.get(generic_key)
-        if cached is not None:
-            logger.info(
-                "Model loaded from cache in %.3fs: %s",
-                time.time() - start_time,
-                model_name,
-            )
-            return cached
-
-        awq_loader = None if is_vlm else AWQQuantLoader.for_model(model_name)
-        cache_key = awq_key if awq_loader is not None else generic_key
-        if is_vlm:
+        # VLM checkpoints use mlx-vlm; text checkpoints use mlx-lm paths.
+        elif is_vlm:
+            load_label = "Model"
             logger.info("Using mlx-vlm for vision-language model")
             model, tokenizer = mlx_vlm_load(model_name)
-        elif awq_loader is not None:
-            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-                model, tokenizer = awq_loader.load(
-                    str(compatible_model_name),
+
+        # AWQ owns detection and dtype alignment; generic text falls through.
+        else:
+            load_label = "Model"
+            awq_loader = AWQQuantLoader.for_model(model_name)
+            if awq_loader is None:
+                model, tokenizer = self._load_mlx_lm_generation_model(
+                    model_name,
+                    tokenizer_config=tokenizer_config,
+                )
+            else:
+                model, tokenizer = self._load_awq_generation_model(
+                    model_name,
+                    awq_loader,
                     target_dtype=target_dtype,
                     tokenizer_config=tokenizer_config,
                 )
-        else:
-            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-                model, tokenizer = mlx_lm_load(
-                    str(compatible_model_name),
-                    tokenizer_config=tokenizer_config,
-                )
 
-        with _MODEL_CACHE_LOCK:
-            _MODEL_CACHE[cache_key] = (model, tokenizer)
-        logger.info("Model loaded in %.2fs: %s", time.time() - start_time, model_name)
+        logger.info(
+            "%s loaded in %.2fs: %s",
+            load_label,
+            time.time() - start_time,
+            model_name,
+        )
+        return model, tokenizer
+
+    def _load_awq_generation_model(
+        self,
+        model_name: str,
+        awq_loader: AWQQuantLoader,
+        *,
+        target_dtype: Any,
+        tokenizer_config: Mapping[str, Any],
+    ) -> tuple[Any, Any]:
+        with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+            return awq_loader.load(
+                str(compatible_model_name),
+                target_dtype=target_dtype,
+                tokenizer_config=tokenizer_config,
+            )
+
+    def _load_mlx_lm_generation_model(
+        self,
+        model_name: str,
+        *,
+        tokenizer_config: Mapping[str, Any],
+    ) -> tuple[Any, Any]:
+        with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+            model, tokenizer = mlx_lm_load(
+                str(compatible_model_name),
+                tokenizer_config=tokenizer_config,
+            )
         return model, tokenizer
 
     def _load_gguf_generation_model(
         self,
         model_name: str,
-        start_time: float,
         model_config: Any,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],
@@ -325,32 +295,13 @@ class ModelLifecycle:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
-        cache_key = GGUFModelLoader.cache_key(
-            model_name, model_config.tokenizer, target_dtype=target_dtype
-        )
-        with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(cache_key)
-        if cached is not None:
-            logger.info(
-                "Model loaded from cache in %.3fs: %s",
-                time.time() - start_time,
-                model_name,
-            )
-            return cached
-
         loader = GGUFModelLoader.for_model(
             model_name,
             config_dir=model_config.tokenizer,
             target_dtype=target_dtype,
             tokenizer_config=dict(tokenizer_config),
         )
-        model, tokenizer = loader.load()
-        with _MODEL_CACHE_LOCK:
-            _MODEL_CACHE[cache_key] = (model, tokenizer)
-        logger.info(
-            "GGUF model loaded in %.2fs: %s", time.time() - start_time, model_name
-        )
-        return model, tokenizer
+        return loader.load()
 
     def resolve_model_dims(self) -> None:
         args = self._runner.model_args

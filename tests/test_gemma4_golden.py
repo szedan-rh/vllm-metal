@@ -315,8 +315,8 @@ def _run_variant(variant: Gemma4Variant) -> dict[str, list[int]]:
     if not os.path.isdir(model_path):
         pytest.skip(f"{variant.model_env}={model_path} is not a directory")
 
-    # MetalConfig and the model cache are process-level singletons; reset
-    # both and drop any previously-loaded model so the variant starts clean.
+    # MetalConfig and assistant state are process-level; reset both so the
+    # variant starts from deterministic lifecycle state.
     from vllm_metal.config import reset_config
     from vllm_metal.v1.model_lifecycle import reset_model_cache
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -95,6 +96,49 @@ def load_stt_model(model_name: str) -> Any:
     return model
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationLoadRequest:
+    """Immutable load-time view of the runner config."""
+
+    model_name: str
+    model_config: Any
+    hf_config: Any
+    is_vlm: bool
+    target_dtype: Any
+    tokenizer_config: Mapping[str, Any]
+
+    @classmethod
+    def from_runner(
+        cls,
+        runner: MetalModelRunner,
+        model_adapter: ModelAdapter,
+    ) -> GenerationLoadRequest:
+        model_config = runner.model_config
+        # vLLM model_config shape varies across backends.
+        hf_config = getattr(model_config, "hf_config", None)
+        is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
+        if model_adapter.should_force_text_backbone(hf_config):
+            is_vlm = False
+
+        return cls(
+            model_name=get_model_download_path(model_config.model),
+            model_config=model_config,
+            hf_config=hf_config,
+            is_vlm=is_vlm,
+            target_dtype=torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype,
+            tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedGenerationModel:
+    """Loaded generation model plus metadata needed to wire the runner."""
+
+    model: Any
+    tokenizer: Any
+    model_args: dict[str, Any]
+
+
 class ModelLifecycle:
     def __init__(
         self,
@@ -105,24 +149,38 @@ class ModelLifecycle:
         self._model_adapter = model_adapter
 
     def load(self) -> None:
+        """Load the generation model and install runner runtime state."""
+
+        request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
+        loaded_model = self._load_generation(request)
+
+        self._install_generation_model(loaded_model, request)
+
+        # Runtime extensions may depend on dimensions derived from model_args.
+        self.resolve_model_dims()
+        self._install_runtime_extensions(
+            loaded_model.model_args,
+            request,
+        )
+
+    def _install_generation_model(
+        self,
+        loaded_model: LoadedGenerationModel,
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install loaded generation state used by runner execution paths."""
+
         runner = self._runner
-        model_name = get_model_download_path(runner.model_config.model)
+        runner.model = loaded_model.model
+        runner.tokenizer = loaded_model.tokenizer
+        runner._is_vlm = request.is_vlm
 
-        model_config = runner.model_config
-        # vLLM model_config shape varies across backends.
-        hf_config = getattr(model_config, "hf_config", None)
-        is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
-        if self._model_adapter.should_force_text_backbone(hf_config):
-            is_vlm = False
-
-        model, tokenizer = self._load_generation_model(model_name, is_vlm)
-
-        runner.model = model
-        runner.tokenizer = tokenizer
-        runner._is_vlm = is_vlm
+        # Adapter state follows the effective VLM mode, not the raw config flag.
         multimodal_adapter = (
-            self._model_adapter.build_multimodal_adapter(model, hf_config)
-            if is_vlm
+            self._model_adapter.build_multimodal_adapter(
+                loaded_model.model, request.hf_config
+            )
+            if request.is_vlm
             else None
         )
         runner._multimodal_adapter = multimodal_adapter
@@ -130,31 +188,82 @@ class ModelLifecycle:
             EncoderCache() if multimodal_adapter is not None else None
         )
 
-        model_args = self._extract_model_args(model, is_vlm)
-        runner.model_args = model_args
-        runner._vocab_size = int(model_args["vocab_size"])
+        # Dimension resolution reads model_args immediately after this phase.
+        runner.model_args = loaded_model.model_args
+        runner._vocab_size = int(loaded_model.model_args["vocab_size"])
         if runner.metal_config.debug:
-            logger.info("Model args: %s", model_args)
-        self.resolve_model_dims()
+            logger.info("Model args: %s", loaded_model.model_args)
+
+    def _install_runtime_extensions(
+        self,
+        model_args: Mapping[str, Any],
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install optional runtime extensions after model dimensions resolve."""
+
+        runner = self._runner
+
+        # Clear stale extension state before loading replacement extensions.
         runner._gemma4_mtp_assistant = None
         gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
             speculative_config=runner.vllm_config.speculative_config,
-            target_hf_config=hf_config,
+            target_hf_config=request.hf_config,
             target_model_args=model_args,
         )
-        runner.kv_cache_dtype = torch_to_mlx(
-            torch.empty(0, dtype=model_config.dtype)
-        ).dtype
+        runner.kv_cache_dtype = request.target_dtype
         runner._gemma4_mtp_assistant = gemma4_mtp_assistant
 
-    def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
+    def _load_generation(
+        self,
+        request: GenerationLoadRequest,
+    ) -> LoadedGenerationModel:
+        model, tokenizer = self._load_generation_model(
+            request.model_name,
+            request.is_vlm,
+            model_config=request.model_config,
+            target_dtype=request.target_dtype,
+            tokenizer_config=request.tokenizer_config,
+        )
+        return LoadedGenerationModel(
+            model=model,
+            tokenizer=tokenizer,
+            model_args=self._extract_model_args(model, request.is_vlm),
+        )
+
+    def _load_generation_model(
+        self,
+        model_name: str,
+        is_vlm: bool,
+        *,
+        model_config: Any | None = None,
+        target_dtype: Any | None = None,
+        tokenizer_config: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, Any]:
+        """Load and cache a text or VLM generation model."""
+
+        model_config = (
+            self._runner.model_config if model_config is None else model_config
+        )
+        tokenizer_config = (
+            {"trust_remote_code": model_config.trust_remote_code}
+            if tokenizer_config is None
+            else dict(tokenizer_config)
+        )
+        if not is_vlm and target_dtype is None:
+            target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
 
         # EngineArgs normalizes local GGUF inputs to quantization="gguf";
         # the GGUF owner handles format-specific validation and loading.
-        if not is_vlm and self._runner.model_config.quantization == "gguf":
-            return self._load_gguf_generation_model(model_name, start_time)
+        if not is_vlm and model_config.quantization == "gguf":
+            return self._load_gguf_generation_model(
+                model_name,
+                start_time,
+                model_config=model_config,
+                target_dtype=target_dtype,
+                tokenizer_config=tokenizer_config,
+            )
 
         # AWQ checkpoints are owned end-to-end by AWQQuantLoader
         # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
@@ -165,12 +274,8 @@ class ModelLifecycle:
         # is served correctly even if the current detection call would
         # have failed (e.g. transient Hub error after the cache was warmed).
         generic_key = _generation_cache_key(model_name, is_vlm=is_vlm)
-        target_dtype: Any = None
         awq_key: tuple[str, str] | None = None
         if not is_vlm:
-            target_dtype = torch_to_mlx(
-                torch.empty(0, dtype=self._runner.model_config.dtype)
-            ).dtype
             awq_key = AWQQuantLoader.cache_key(model_name, target_dtype=target_dtype)
 
         with _MODEL_CACHE_LOCK:
@@ -187,9 +292,6 @@ class ModelLifecycle:
 
         awq_loader = None if is_vlm else AWQQuantLoader.for_model(model_name)
         cache_key = awq_key if awq_loader is not None else generic_key
-        tokenizer_config = {
-            "trust_remote_code": self._runner.model_config.trust_remote_code
-        }
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
             model, tokenizer = mlx_vlm_load(model_name)
@@ -213,13 +315,16 @@ class ModelLifecycle:
         return model, tokenizer
 
     def _load_gguf_generation_model(
-        self, model_name: str, start_time: float
+        self,
+        model_name: str,
+        start_time: float,
+        model_config: Any,
+        target_dtype: Any,
+        tokenizer_config: Mapping[str, Any],
     ) -> tuple[Any, Any]:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
-        model_config = self._runner.model_config
-        target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
         cache_key = GGUFModelLoader.cache_key(
             model_name, model_config.tokenizer, target_dtype=target_dtype
         )
@@ -237,7 +342,7 @@ class ModelLifecycle:
             model_name,
             config_dir=model_config.tokenizer,
             target_dtype=target_dtype,
-            tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
+            tokenizer_config=dict(tokenizer_config),
         )
         model, tokenizer = loader.load()
         with _MODEL_CACHE_LOCK:

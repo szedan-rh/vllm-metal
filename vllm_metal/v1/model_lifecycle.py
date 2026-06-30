@@ -37,11 +37,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def reset_model_cache() -> None:
-    """Clear lifecycle-owned assistant caches."""
-    Gemma4MTPAssistantLoader.clear_cache()
-
-
 def load_stt_model(model_name: str) -> Any:
     """Load an STT model.
 
@@ -213,41 +208,43 @@ class ModelLifecycle:
         )
         if not is_vlm and target_dtype is None:
             target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
-        logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
-        start_time = time.time()
 
-        # GGUF is a text load format; keep optional dependency handling there.
-        if not is_vlm and model_config.quantization == "gguf":
+        start_time = time.time()
+        is_gguf = not is_vlm and model_config.quantization == "gguf"
+        awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
+
+        # GGUF text checkpoints use the local GGUF owner.
+        if is_gguf:
             load_label = "GGUF model"
-            model, tokenizer = self._load_gguf_generation_model(
+            model, tokenizer = self._load_gguf_text_model(
                 model_name,
-                model_config=model_config,
-                target_dtype=target_dtype,
-                tokenizer_config=tokenizer_config,
+                model_config,
+                target_dtype,
+                tokenizer_config,
             )
 
-        # VLM checkpoints use mlx-vlm; text checkpoints use mlx-lm paths.
+        # VLM checkpoints use mlx-vlm directly.
         elif is_vlm:
-            load_label = "Model"
-            logger.info("Using mlx-vlm for vision-language model")
+            load_label = "MLX-VLM model"
             model, tokenizer = mlx_vlm_load(model_name)
 
-        # AWQ owns detection and dtype alignment; generic text falls through.
+        # AWQ text checkpoints own detection, load config, and dtype alignment.
+        elif awq_loader is not None:
+            load_label = "AWQ model"
+            model, tokenizer = self._load_awq_text_model(
+                model_name,
+                awq_loader,
+                target_dtype,
+                tokenizer_config,
+            )
+
+        # Plain text checkpoints use mlx-lm with vllm-metal path adaptation.
         else:
-            load_label = "Model"
-            awq_loader = AWQQuantLoader.for_model(model_name)
-            if awq_loader is None:
-                model, tokenizer = self._load_mlx_lm_generation_model(
-                    model_name,
-                    tokenizer_config=tokenizer_config,
-                )
-            else:
-                model, tokenizer = self._load_awq_generation_model(
-                    model_name,
-                    awq_loader,
-                    target_dtype=target_dtype,
-                    tokenizer_config=tokenizer_config,
-                )
+            load_label = "MLX-LM model"
+            model, tokenizer = self._load_mlx_lm_text_model(
+                model_name,
+                tokenizer_config,
+            )
 
         logger.info(
             "%s loaded in %.2fs: %s",
@@ -257,11 +254,10 @@ class ModelLifecycle:
         )
         return model, tokenizer
 
-    def _load_awq_generation_model(
+    def _load_awq_text_model(
         self,
         model_name: str,
         awq_loader: AWQQuantLoader,
-        *,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],
     ) -> tuple[Any, Any]:
@@ -272,10 +268,9 @@ class ModelLifecycle:
                 tokenizer_config=tokenizer_config,
             )
 
-    def _load_mlx_lm_generation_model(
+    def _load_mlx_lm_text_model(
         self,
         model_name: str,
-        *,
         tokenizer_config: Mapping[str, Any],
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
@@ -285,7 +280,7 @@ class ModelLifecycle:
             )
         return model, tokenizer
 
-    def _load_gguf_generation_model(
+    def _load_gguf_text_model(
         self,
         model_name: str,
         model_config: Any,

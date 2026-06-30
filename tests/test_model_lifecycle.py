@@ -490,7 +490,7 @@ class TestModelLifecycle:
 
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
         reset_config()
-        model_lifecycle.reset_model_cache()
+        Gemma4MTPAssistantLoader.clear_cache()
         _patch_mlx_lm_qwen35_fp8_sanitize()
 
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
@@ -508,7 +508,7 @@ class TestModelLifecycle:
             assert runner.model is not None
             assert int(runner.model_args["vocab_size"]) > 0
         finally:
-            model_lifecycle.reset_model_cache()
+            Gemma4MTPAssistantLoader.clear_cache()
 
     def test_load_extracts_text_model_config_from_loaded_model(
         self,
@@ -604,7 +604,9 @@ class TestModelLifecycle:
 
         assert runner._gemma4_mtp_assistant is None
 
-    def test_reset_model_cache_clears_gemma4_mtp_assistant_cache(self) -> None:
+    def test_gemma4_mtp_assistant_loader_clear_cache_resets_cached_load(
+        self,
+    ) -> None:
         load_model_calls = 0
 
         def _load_model(
@@ -658,7 +660,7 @@ class TestModelLifecycle:
         assert first is second
         assert load_model_calls == 1
 
-        model_lifecycle.reset_model_cache()
+        Gemma4MTPAssistantLoader.clear_cache()
 
         third = loader.load_if_needed(
             speculative_config=spec_config,

@@ -768,6 +768,20 @@ def test_manager_target_modules_filter_excludes_unmatched() -> None:
     assert not isinstance(model.fc2, layers_mod.MLXLinearWithLoRA)
 
 
+def test_manager_rejects_zero_wrapped_modules() -> None:
+    model = _TwoLinearModel()
+    with pytest.raises(RuntimeError, match="no LoRA target modules"):
+        model_manager_mod.MLXLoRAModelManager(
+            model=model,
+            lora_config=_lora_config_stub(
+                max_loras=1, max_lora_rank=1, target_modules=["missing"]
+            ),
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            dtype=mx.float32,
+        )
+
+
 # Runner routing: paged forward processes decode tokens before prefill tokens,
 
 

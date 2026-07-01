@@ -80,12 +80,12 @@ class MLXLoRAModelManager:
             if can_wrap(m) and is_in_target_modules(name, targets)
         ]
         if not repls:
-            logger.warning(
-                "MLXLoRAModelManager wrapped 0 modules — model has no plain "
-                "nn.Linear (quantized models are not supported in v1) or "
-                "target_modules excludes everything."
+            raise RuntimeError(
+                "MLXLoRAModelManager found no LoRA target modules to wrap. "
+                "The model may expose only quantized layers, which v1 LoRA "
+                "does not support yet, or LoRAConfig.target_modules may "
+                "exclude every wrappable nn.Linear."
             )
-            return
         for name, w in repls:
             w.set_mapping(self.punica_wrapper)
             self.modules[name] = w

@@ -924,6 +924,29 @@ def test_prepare_step_raises_for_unloaded_lora_id() -> None:
         rt.prepare_step([(7, 1)])
 
 
+def test_prepare_step_marks_prefill_mapping() -> None:
+    class CapturingManager:
+        def __init__(self) -> None:
+            self.mapping = None
+
+        def set_active_adapters(self, lora_requests, mapping) -> None:
+            self.mapping = mapping
+
+    class Request:
+        pass
+
+    manager = CapturingManager()
+    rt = runtime_mod.MetalLoRARuntime()
+    rt._manager = manager
+    rt._loaded[7] = Request()
+
+    rt.prepare_step([(7, 3)])
+
+    assert manager.mapping.index_mapping == (7, 7, 7)
+    assert manager.mapping.prompt_mapping == (7,)
+    assert manager.mapping.is_prefill is True
+
+
 def test_worker_manager_rejects_cpu_loras_gt_max_loras() -> None:
     with pytest.raises(NotImplementedError, match="max_cpu_loras > max_loras"):
         worker_manager_mod.MetalWorkerLoRAManager(

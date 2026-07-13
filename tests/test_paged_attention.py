@@ -7,8 +7,17 @@ Run with:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 
 from vllm_metal.attention.context import (
     OffsetCache,
@@ -222,6 +231,242 @@ class TestPrepare:
 
 class TestPackedRoPE:
     """Tests for per-request RoPE position reset in packed prefill."""
+
+    class RecordingRoPE(nn.RoPE):
+        def __init__(self) -> None:
+            super().__init__(dims=8, traditional=False, base=10_000.0)
+            self.calls = []
+
+        def __call__(self, x, offset=0):
+            self.calls.append((x.shape, offset))
+            return super().__call__(x, offset=offset)
+
+    def test_native_rope_batches_single_token_segments(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
+        module = SimpleNamespace(rope=rope)
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.arange(1 * 2 * 4 * 8, dtype=mx.float32).reshape(1, 2, 4, 8) / 100
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 11, 29, 47]
+
+        expected_q = mx.concatenate(
+            [
+                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [
+                reference_rope(k[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert len(rope.calls) == 2
+        assert rope.calls[0][0] == (4, 3, 1, 8)
+        assert rope.calls[1][0] == (4, 2, 1, 8)
+        assert rope.calls[0][1].shape == (4,)
+        assert rope.calls[0][1].tolist() == offsets
+        assert rope.calls[1][1].shape == (4,)
+        assert rope.calls[1][1].tolist() == offsets
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    def test_native_rope_matches_segment_reference_for_float16_rows(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        dims = 128
+        segment_count = 4
+        offsets = [5, 5, 5, 5]
+        cu_seqlens = [0, 1, 2, 3, 4]
+        rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
+        reference_rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
+        module = SimpleNamespace(rope=rope)
+        q_rows = [
+            (mx.arange(3 * dims, dtype=mx.float32).reshape(3, 1, dims) / 100 + row)
+            .astype(mx.float16)
+            .tolist()
+            for row in range(segment_count)
+        ]
+        k_rows = [
+            (mx.arange(2 * dims, dtype=mx.float32).reshape(2, 1, dims) / 100 + row)
+            .astype(mx.float16)
+            .tolist()
+            for row in range(segment_count)
+        ]
+        q = mx.transpose(mx.array(q_rows, dtype=mx.float16), (2, 1, 0, 3))
+        k = mx.transpose(mx.array(k_rows, dtype=mx.float16), (2, 1, 0, 3))
+
+        expected_q = mx.concatenate(
+            [
+                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(segment_count)
+            ],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [
+                reference_rope(k[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(segment_count)
+            ],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-3, atol=1e-3).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-3, atol=1e-3).item()
+
+    @pytest.mark.parametrize(
+        "rope",
+        [
+            Llama3RoPE(
+                8,
+                scaling_config={
+                    "factor": 8.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 8192,
+                },
+            ),
+            ProportionalRoPE(8, 8),
+            SuScaledRoPE(8),
+            YarnRoPE(8),
+        ],
+    )
+    def test_mlx_lm_rope_wrappers_match_segment_reference(self, rope):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        module = SimpleNamespace(rope=rope)
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.arange(1 * 2 * 4 * 8, dtype=mx.float32).reshape(1, 2, 4, 8) / 100
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 11, 29, 47]
+
+        expected_q = mx.concatenate(
+            [rope(q[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [rope(k[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    def test_native_rope_uses_vector_zero_offsets_for_implicit_offsets(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        cu_seqlens = [0, 1, 2, 3, 4]
+        q = mx.zeros((1, 3, 4, 8), dtype=mx.float32)
+        k = mx.zeros((1, 2, 4, 8), dtype=mx.float32)
+
+        apply_packed_rope(module, q, k, cu_seqlens)
+
+        assert len(rope.calls) == 2
+        assert rope.calls[0][1].shape == (4,)
+        assert rope.calls[0][1].tolist() == [0, 0, 0, 0]
+        assert rope.calls[1][1].shape == (4,)
+        assert rope.calls[1][1].tolist() == [0, 0, 0, 0]
+
+    def test_batched_rope_preserves_keys_when_not_applied(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
+        module = SimpleNamespace(rope=rope)
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 17, 41, 83]
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.zeros((1, 2, 4, 8), dtype=mx.float32)
+        expected_q = mx.concatenate(
+            [
+                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+
+        q_out, k_out = apply_packed_rope(
+            module,
+            q,
+            k,
+            cu_seqlens,
+            offsets=offsets,
+            apply_keys=False,
+        )
+        mx.eval(expected_q, q_out)
+
+        assert len(rope.calls) == 1
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert k_out is k
+
+    def test_multi_token_segments_keep_per_segment_call_contract(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        q = mx.zeros((1, 2, 6, 8))
+        k = mx.zeros((1, 1, 6, 8))
+
+        apply_packed_rope(module, q, k, [0, 2, 4, 6], offsets=[3, 5, 8])
+
+        assert rope.calls == [
+            ((1, 2, 2, 8), 3),
+            ((1, 1, 2, 8), 3),
+            ((1, 2, 2, 8), 5),
+            ((1, 1, 2, 8), 5),
+            ((1, 2, 2, 8), 8),
+            ((1, 1, 2, 8), 8),
+        ]
+
+    def test_custom_rope_keeps_per_segment_call_contract(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        class RecordingRoPE:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, x, offset=0):
+                self.calls.append((x.shape, offset))
+                return x + offset
+
+        rope = RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        q = mx.zeros((1, 2, 3, 8))
+        k = mx.zeros((1, 1, 3, 8))
+
+        q_out, k_out = apply_packed_rope(module, q, k, [0, 1, 2, 3], offsets=[3, 5, 8])
+
+        assert [offset for _, offset in rope.calls] == [3, 3, 5, 5, 8, 8]
+        assert q_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
+        assert k_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
 
     def test_positions_reset_per_request(self):
         """Each packed request's RoPE should start from position 0."""

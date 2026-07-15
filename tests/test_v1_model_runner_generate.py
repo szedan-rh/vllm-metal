@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -237,14 +238,19 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         scheduled_spec_decode_tokens: dict[str, list[int]],
         num_invalid_spec_tokens: dict[str, int] | None = None,
         num_spec_tokens_to_schedule: int = 1,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=num_invalid_spec_tokens,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            finished_req_ids=set(),
         )
 
     def _make_gemma4_mtp_config(self) -> SimpleNamespace:
@@ -359,6 +365,56 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state is not None
         assert runner._execute_model_state.target_hidden_states is not None
         assert runner._execute_model_state.cu_seqlens == [0, 3]
+
+    def test_start_paged_forward_drops_scheduler_padded_drafts(
+        self, monkeypatch
+    ) -> None:
+        """vLLM 0.25 pads a newly admitted decode request with placeholder drafts.
+
+        The runner must hand ``build_decode_segments`` the filtered map, so the
+        request gets a single query row instead of splicing ``-1`` into the
+        embedding lookup.
+        """
+        runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["r0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            captured["input_ids"] = input_ids.tolist()
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 16)),
+                hidden_states=mx.ones((1, 4)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [0, 1]
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 3},
+            {"r0": [-1, -1]},
+        )
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6]]
+        assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert runner._execute_model_state.cu_seqlens == [0, 1]
 
     def test_start_paged_forward_skips_hidden_states_without_drafts(
         self, monkeypatch
@@ -1156,11 +1212,11 @@ class TestV1MetalModelRunnerExecuteModel:
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         num_invalid_spec_tokens: dict[str, int] | None = None,
         scheduled_new_reqs: list[SimpleNamespace] | None = None,
-    ) -> SimpleNamespace:
+    ) -> SchedulerOutput:
         req_ids = cached_req_ids or []
-        return SimpleNamespace(
+        return SchedulerOutput(
             scheduled_new_reqs=scheduled_new_reqs or [],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=req_ids,
                 resumed_req_ids=set(),
                 new_token_ids=[],
@@ -1385,7 +1441,7 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            scheduler_output=SchedulerOutput.make_empty(),
         )
 
         assert len(submitted) == 1
@@ -1423,7 +1479,7 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            scheduler_output=SchedulerOutput.make_empty(),
         )
 
         assert len(submitted) == 1
@@ -1519,10 +1575,10 @@ class TestV1MetalModelRunnerGDNLifecycle:
         resumed_req_ids: set[str] | None = None,
         preempted_req_ids: set[str] | None = None,
         scheduled_encoder_inputs: dict[str, list[int]] | None = None,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=list(resumed_req_ids or ()),
                 resumed_req_ids=resumed_req_ids or set(),
                 new_token_ids=[],
@@ -1647,7 +1703,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
             start_pos=0,
             full_prompt_token_ids=[9],
         )
-        scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+        scheduler_output = SchedulerOutput.make_empty()
 
         runner._start_paged_forward(
             mr._ExecutionBatch(),

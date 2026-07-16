@@ -29,7 +29,6 @@ from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
-    PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
     get_config,
@@ -744,14 +743,34 @@ class WorkerCachePlanner:
         )
 
     def _memory_fraction(self) -> float:
-        if self._worker.metal_config.is_auto_memory:
+        """Resolve the paged KV memory fraction.
+
+        Precedence:
+        1. Numeric VLLM_METAL_MEMORY_FRACTION, for example 0.6, wins.
+        2. Otherwise, VLLM_METAL_MEMORY_FRACTION=auto uses the user-provided
+           --gpu-memory-utilization value.
+        3. If the user did not provide --gpu-memory-utilization, vLLM 0.25.1
+           supplies its default value, 0.92.
+        """
+        metal_config = self._worker.metal_config
+
+        if not metal_config.is_auto_memory:
+            metal_memory_fraction = metal_config.memory_fraction
             logger.info(
-                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-                "defaulting to %.2f for paged path",
-                PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
+                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
+                metal_memory_fraction,
             )
-            return PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
-        return self._worker.metal_config.memory_fraction
+            return metal_memory_fraction
+
+        vllm_memory_fraction = (
+            self._worker.vllm_config.cache_config.gpu_memory_utilization
+        )
+        logger.info(
+            "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
+            "using --gpu-memory-utilization=%.2f",
+            vllm_memory_fraction,
+        )
+        return vllm_memory_fraction
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()
